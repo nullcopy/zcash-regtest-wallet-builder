@@ -81,6 +81,7 @@ def run_all_phases():
     logger.info("=" * 70)
 
     phase_manifests = []
+    all_transactions = []  # Accumulated tx records for computed balances
     process = None
     rpc = None
 
@@ -99,6 +100,7 @@ def run_all_phases():
                 phase_index=i,
                 prev_process=process,
                 prev_rpc=rpc,
+                all_prior_transactions=all_transactions,
             )
             phase_manifests.append(manifest)
 
@@ -147,7 +149,8 @@ def run_all_phases():
 
 def run_single_phase(phase_index: int,
                      prev_process: subprocess.Popen | None = None,
-                     prev_rpc: ZcashRPC | None = None) -> dict:
+                     prev_rpc: ZcashRPC | None = None,
+                     all_prior_transactions: list | None = None) -> dict:
     """
     Execute a single build phase.
 
@@ -260,6 +263,10 @@ def run_single_phase(phase_index: int,
     # ---------------------------------------------------------------
     # 9. Create and write phase manifest
     # ---------------------------------------------------------------
+    # Add this phase's transactions to the accumulator for computed balances
+    if all_prior_transactions is not None:
+        all_prior_transactions.append(transactions)
+
     manifest = create_phase_manifest(
         phase_index=phase_index,
         rpc=rpc,
@@ -267,6 +274,7 @@ def run_single_phase(phase_index: int,
         external_addrs=external_addrs,
         viewing_keys=viewing_keys,
         transactions=transactions,
+        all_prior_transactions=all_prior_transactions,
     )
     write_phase_manifest(manifest, phase_index)
 

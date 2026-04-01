@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 
 from lib.constants import (
     Pool,
+    PoolPermission,
     NetworkUpgrade,
     NETWORK_UPGRADES,
     MANIFESTS_DIR,
@@ -59,17 +60,20 @@ def collect_balance_snapshot(rpc: ZcashRPC, phase_index: int) -> dict:
     }
     note_counts = {"sprout": 0, "sapling": 0, "orchard": 0}
     utxo_count = 0
+    coinbase_count = 0
 
-    # Get transparent UTXOs
+    # --- Primary balance source: z_gettotalbalance ---
+    # Available in ALL zcashd versions. Returns transparent + private totals.
     try:
-        utxos = rpc.listunspent(1)
-        utxo_count = len(utxos)
-        t_balance = sum(u.get("amount", 0) for u in utxos)
-        balances["transparent"] = f"{t_balance:.8f}"
+        total_bal = rpc.z_gettotalbalance(1)
+        balances["transparent"] = total_bal.get("transparent", "0")
+        private_total = float(total_bal.get("private", "0"))
     except Exception as e:
-        logger.warning("Failed to list transparent UTXOs: %s", e)
+        logger.warning("Failed to get total balance: %s", e)
+        private_total = 0
 
-    # Get shielded notes
+    # --- Per-pool breakdown via z_listunspent (v2.0+ only) ---
+    # z_listunspent doesn't exist in v1.0.x ("Method not found").
     try:
         notes = rpc.z_listunspent(1)
         for note in notes:
@@ -85,17 +89,33 @@ def collect_balance_snapshot(rpc: ZcashRPC, phase_index: int) -> dict:
             elif pool == "orchard":
                 note_counts["orchard"] += 1
                 balances["orchard"] = f"{float(balances['orchard']) + amount:.8f}"
-    except Exception as e:
-        logger.warning("Failed to list shielded notes: %s", e)
+    except Exception:
+        # z_listunspent unavailable (v1.0.x) or failed.
+        # Attribute the entire private balance to the first available
+        # shielded pool. Imprecise but better than reporting 0.
+        if private_total > 0:
+            nu = NETWORK_UPGRADES[phase_index]
+            available_shielded = [
+                p for p in [Pool.SPROUT, Pool.SAPLING, Pool.ORCHARD]
+                if nu.pools.get(p) not in (None, PoolPermission.UNAVAILABLE)
+            ]
+            if available_shielded:
+                pool_name = available_shielded[0].value
+                balances[pool_name] = f"{private_total:.8f}"
+                logger.info(
+                    "z_listunspent unavailable; attributed %.8f private balance to %s",
+                    private_total, pool_name,
+                )
 
-    # Count coinbase UTXOs specifically (for tracking unspent coinbase per era)
-    coinbase_count = 0
+    # --- Transparent UTXO count ---
     try:
+        utxos = rpc.listunspent(1)
+        utxo_count = len(utxos)
         for utxo in utxos:
             if utxo.get("generated", False):
                 coinbase_count += 1
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to list transparent UTXOs: %s", e)
 
     return {
         "balances": balances,
@@ -103,6 +123,49 @@ def collect_balance_snapshot(rpc: ZcashRPC, phase_index: int) -> dict:
         "utxo_count": utxo_count,
         "coinbase_utxo_count": coinbase_count,
     }
+
+
+def compute_shielded_balances_from_txs(
+        all_phase_transactions: list[list["TransactionRecord"]]) -> dict:
+    """
+    Compute cumulative shielded balances from transaction records.
+
+    Intermediate zcashd versions (v1.1.1 through v4.1.1) cannot accurately
+    report shielded balances via z_gettotalbalance or z_listunspent after
+    a version switch (the wallet note index isn't cross-version compatible,
+    and -rescan crashes on Sprout commitment tree assertions).
+
+    Instead, we compute expected balances from the transactions we created:
+      - z_shieldcoinbase: adds to the target pool
+      - z_sendmany intra-pool: net zero (minus fee)
+      - z_sendmany cross-pool: subtracts from source, adds to dest
+      - external sends: subtracts from source
+
+    Returns dict mapping pool name -> cumulative balance string.
+    """
+    pool_balances = {"sprout": 0.0, "sapling": 0.0, "orchard": 0.0}
+
+    for phase_txs in all_phase_transactions:
+        for tx in phase_txs:
+            amount = float(tx.amount_zec)
+            fee = float(tx.fee_zec)
+            to_pool = tx.to_pool
+            from_pool = tx.from_pool
+
+            # Inflow to shielded pool
+            if to_pool in pool_balances and not to_pool.startswith("external_"):
+                pool_balances[to_pool] += amount
+
+            # Outflow from shielded pool
+            if from_pool in pool_balances:
+                if from_pool == to_pool:
+                    # Intra-pool: only fee is lost
+                    pool_balances[from_pool] -= fee
+                else:
+                    # Cross-pool or external: full amount + fee
+                    pool_balances[from_pool] -= (amount + fee)
+
+    return {k: f"{max(0, v):.8f}" for k, v in pool_balances.items()}
 
 
 def collect_chain_info(rpc: ZcashRPC) -> dict:
@@ -140,7 +203,8 @@ def create_phase_manifest(phase_index: int,
                           addrs: GeneratedAddresses,
                           external_addrs: GeneratedAddresses,
                           viewing_keys: dict,
-                          transactions: list[TransactionRecord]) -> dict:
+                          transactions: list[TransactionRecord],
+                          all_prior_transactions: list[list[TransactionRecord]] | None = None) -> dict:
     """
     Create a complete manifest for a single build phase.
 
@@ -149,12 +213,15 @@ def create_phase_manifest(phase_index: int,
     the balances are.
 
     Args:
-        phase_index:    Build phase number
-        rpc:            RPC client (for balance/chain queries)
-        addrs:          Addresses generated in this phase
-        external_addrs: External addresses used in this phase
-        viewing_keys:   Exported viewing keys
-        transactions:   All transaction records from this phase
+        phase_index:            Build phase number
+        rpc:                    RPC client (for balance/chain queries)
+        addrs:                  Addresses generated in this phase
+        external_addrs:         External addresses used in this phase
+        viewing_keys:           Exported viewing keys
+        transactions:           All transaction records from this phase
+        all_prior_transactions: Transaction records from ALL phases up to and
+                                including this one (for computing shielded balances
+                                when zcashd can't report them accurately)
 
     Returns:
         Complete manifest dict.
@@ -165,6 +232,21 @@ def create_phase_manifest(phase_index: int,
     snapshot = collect_balance_snapshot(rpc, phase_index)
     chain_info = collect_chain_info(rpc)
     zcashd_commit = get_zcashd_commit(rpc)
+
+    # If zcashd reports 0 shielded balance but we know we created shielded
+    # transactions, use computed balances instead. This happens in phases 1-5
+    # where intermediate zcashd versions can't see notes from prior versions.
+    if all_prior_transactions is not None:
+        computed = compute_shielded_balances_from_txs(all_prior_transactions)
+        for pool in ["sprout", "sapling", "orchard"]:
+            rpc_val = float(snapshot["balances"].get(pool, "0"))
+            computed_val = float(computed.get(pool, "0"))
+            if rpc_val == 0 and computed_val > 0:
+                snapshot["balances"][pool] = computed[pool]
+                logger.info(
+                    "Using computed %s balance (%.8f) instead of RPC-reported 0",
+                    pool, computed_val,
+                )
 
     # Build nuparams map for this phase
     nuparams = {}

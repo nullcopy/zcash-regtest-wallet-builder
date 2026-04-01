@@ -301,7 +301,14 @@ def switch_version(from_phase: int, to_phase: int,
     # 2. Checkpoint wallet.dat
     checkpoint_wallet(from_phase, datadir)
 
-    # 3. Start the new version (no -reindex; chainstate is forward-compatible).
+    # 3. Start the new version (no -reindex, no -rescan).
+    # -reindex is harmful (re-validates all blocks, causes rollbacks).
+    # -rescan is harmful (crashes on Sprout commitment tree assertion when
+    # crossing major version boundaries, e.g. v1.0.15 -> v1.1.1).
+    # The wallet DOES contain all notes from previous versions, but
+    # intermediate versions can't always report their balances accurately
+    # via z_gettotalbalance/z_listunspent. The manifest compensates by
+    # computing shielded balances from transaction records.
     new_process = start_zcashd(
         phase_index=to_phase,
         datadir=datadir,

@@ -64,6 +64,7 @@ from lib.manifest import (
     write_full_manifest,
 )
 from lib.verification import verify_all
+from lib.key_imports import import_keys_for_phase
 
 logger = logging.getLogger(__name__)
 
@@ -195,9 +196,16 @@ def run_single_phase(phase_index: int,
     addrs = generate_phase_addresses(rpc, phase_index)
 
     # ---------------------------------------------------------------
-    # 4. Generate external (throwaway) addresses
+    # 3. Start external wallet, generate external addresses + import keys
     # ---------------------------------------------------------------
-    external_addrs = _generate_external_for_phase(phase_index)
+    ext_process, ext_rpc = _start_external_wallet(phase_index)
+    if ext_rpc is not None:
+        external_addrs = generate_external_addresses(ext_rpc, phase_index)
+        imported_keys = import_keys_for_phase(rpc, ext_rpc, phase_index)
+        stop_zcashd(rpc=ext_rpc, process=ext_process)
+    else:
+        external_addrs = GeneratedAddresses()
+        imported_keys = None
 
     # ---------------------------------------------------------------
     # 5. Mine blocks for coinbase creation + maturity
@@ -276,6 +284,8 @@ def run_single_phase(phase_index: int,
         transactions=transactions,
         all_prior_transactions=all_prior_transactions,
     )
+    if imported_keys is not None:
+        manifest["imported_keys"] = imported_keys.to_dict()
     write_phase_manifest(manifest, phase_index)
 
     # Checkpoint wallet.dat for this phase
@@ -293,42 +303,24 @@ def run_single_phase(phase_index: int,
     return manifest
 
 
-def _generate_external_for_phase(phase_index: int) -> GeneratedAddresses:
-    """
-    Start a temporary external zcashd and generate throwaway addresses.
-
-    The external wallet exists in a separate data directory and only runs
-    long enough to generate addresses. It doesn't need to sync the chain.
-    """
-    nu = NETWORK_UPGRADES[phase_index]
+def _start_external_wallet(phase_index: int) -> tuple[subprocess.Popen | None,
+                                                        ZcashRPC | None]:
+    """Start the external zcashd wallet for address/key generation."""
     ext_datadir = os.path.join(EXTERNAL_DATADIR, f"phase_{phase_index:02d}")
-
-    logger.info("Starting external zcashd for address generation...")
-
+    logger.info("Starting external zcashd for address/key generation...")
     try:
-        # Start external zcashd with the same version as the current phase
         ext_process = start_zcashd(
             phase_index=phase_index,
             datadir=ext_datadir,
             rpcport=RPC_PORT_EXTERNAL,
             reindex=False,
         )
-
         ext_rpc = ZcashRPC(rpcport=RPC_PORT_EXTERNAL)
         ext_rpc.wait_for_ready(timeout=60)
-
-        # Generate external addresses
-        external_addrs = generate_external_addresses(ext_rpc, phase_index)
-
-        # Stop external zcashd
-        stop_zcashd(rpc=ext_rpc, process=ext_process)
-
-        return external_addrs
-
+        return ext_process, ext_rpc
     except Exception as e:
-        logger.error("Failed to generate external addresses: %s", e)
-        logger.warning("Proceeding without external addresses for phase %d", phase_index)
-        return GeneratedAddresses()
+        logger.error("Failed to start external zcashd: %s", e)
+        return None, None
 
 
 def _calculate_send_amount(phase_index: int) -> float:

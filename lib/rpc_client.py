@@ -581,6 +581,44 @@ class ZcashRPC:
         """List all transparent addresses (deprecated in newer versions)."""
         return self.call("getaddressesbyaccount", account)
 
+    # -- Key import --
+
+    def importprivkey(self, privkey, label="", rescan=False):
+        """Import a transparent private key (WIF-encoded). Makes the address spendable."""
+        return self.call("importprivkey", privkey, label, rescan)
+
+    def importaddress(self, address_or_script, label="", rescan=False, p2sh=False):
+        """Import a transparent address or script as watch-only (not spendable).
+
+        The p2sh parameter was added in a later zcashd version. If it fails
+        with 4 args, the caller should retry with 3 (without p2sh).
+        """
+        if p2sh:
+            return self.call("importaddress", address_or_script, label, rescan, p2sh)
+        return self.call("importaddress", address_or_script, label, rescan)
+
+    def importpubkey(self, pubkey_hex, label="", rescan=False):
+        """Import a transparent public key as watch-only (not spendable).
+
+        Not available in very old zcashd versions (v1.0.x returns 404).
+        """
+        return self.call("importpubkey", pubkey_hex, label, rescan)
+
+    def z_importkey(self, spending_key, rescan="no", start_height=0):
+        """Import a shielded spending key (Sprout or Sapling). Makes the address spendable."""
+        return self.call("z_importkey", spending_key, rescan, start_height)
+
+    def z_importviewingkey(self, viewing_key, rescan="no", start_height=0):
+        """Import a shielded viewing key (Sprout or Sapling). Read-only, not spendable.
+
+        Very old versions (v1.0.x) may not accept the rescan/startHeight params.
+        """
+        try:
+            return self.call("z_importviewingkey", viewing_key, rescan, start_height)
+        except RPCError:
+            # Fall back to single-arg form for old versions
+            return self.call("z_importviewingkey", viewing_key)
+
     # -- Node control --
 
     def stop(self):

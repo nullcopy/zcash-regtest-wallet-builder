@@ -35,7 +35,7 @@ from lib.constants import (
     get_active_pools,
     get_withdrawable_pools,
 )
-from lib.rpc_client import ZcashRPC, RPCError
+from lib.rpc_client import ZcashRPC, RPCError, OperationFailed
 from lib.addresses import GeneratedAddresses
 
 
@@ -193,8 +193,25 @@ def shield_coinbase(rpc: ZcashRPC, to_address: str, to_pool: str,
             logger.info("No UTXOs shielded in this batch, stopping")
             break
 
-        # Wait for the async operation to complete
-        op_result = rpc.wait_for_operation(opid)
+        # Wait for the async operation to complete.
+        # Retry once on CommitTransaction failures (sporadic race condition).
+        try:
+            op_result = rpc.wait_for_operation(opid)
+        except OperationFailed as e:
+            if "CommitTransaction" in str(e) or "bad-txns" in str(e):
+                logger.warning("Retrying shield after CommitTransaction failure")
+                rpc.generate(2)
+                major = int(NETWORK_UPGRADES[phase_index].zcashd_version.split(".")[0])
+                if major >= 6 and policy is not None:
+                    result = rpc.call("z_shieldcoinbase", "*", to_address,
+                                      fee, batch_size, "", policy)
+                else:
+                    result = rpc.call("z_shieldcoinbase", "*", to_address,
+                                      fee, batch_size)
+                opid = result.get("opid")
+                op_result = rpc.wait_for_operation(opid)
+            else:
+                raise
         txid = op_result.get("txid", "unknown")
 
         # Mine a block to confirm the shielding transaction
@@ -252,11 +269,23 @@ def send_between_pools(rpc: ZcashRPC, from_address: str, to_address: str,
     Returns:
         TransactionRecord for the completed send.
     """
+    # Round to 8 decimal places (zatoshi precision) to avoid "Invalid amount"
+    # errors from floating-point artifacts like 0.008000000000000001.
+    amount = round(amount, 8)
     description = f"{from_pool} -> {to_pool}: {amount} ZEC"
 
     if from_pool == "transparent" and to_pool == "transparent":
-        # Simple transparent-to-transparent send
-        txid = rpc.sendtoaddress(to_address, amount)
+        # Simple transparent-to-transparent send.
+        # Retry once on rejection (stale UTXO state after version switch).
+        try:
+            txid = rpc.sendtoaddress(to_address, amount)
+        except RPCError as e:
+            if "rejected" in str(e) or "bad-txns" in str(e):
+                logger.warning("Retrying transparent send after rejection")
+                rpc.generate(2)
+                txid = rpc.sendtoaddress(to_address, amount)
+            else:
+                raise
     else:
         # Use z_sendmany for any send involving a shielded pool
         recipients = [{"address": to_address, "amount": amount}]
@@ -275,7 +304,20 @@ def send_between_pools(rpc: ZcashRPC, from_address: str, to_address: str,
             # positional args and will dump the help text if you try.
             opid = rpc.z_sendmany(from_address, recipients)
 
-        op_result = rpc.wait_for_operation(opid)
+        try:
+            op_result = rpc.wait_for_operation(opid)
+        except OperationFailed as e:
+            if "CommitTransaction" in str(e) or "bad-txns" in str(e):
+                # Sporadic race condition. Mine a block to clear mempool
+                # state and retry once.
+                logger.warning("Retrying after CommitTransaction failure: %s", e)
+                rpc.generate(2)
+                opid = rpc.z_sendmany(from_address, recipients) if policy is None \
+                    else rpc.z_sendmany(from_address, recipients, 1,
+                                        v5_fee if policy else fee, policy)
+                op_result = rpc.wait_for_operation(opid)
+            else:
+                raise
         txid = op_result.get("txid", "unknown")
 
     # Mine a block to confirm
@@ -377,8 +419,8 @@ def execute_phase_operations(rpc: ZcashRPC, phase_index: int,
     # transparent->shielded sends have UTXOs to spend.
     if addrs.transparent:
         try:
-            rpc.sendtoaddress(addrs.transparent[0], send_amount * 5)
-            rpc.generate(1)
+            rpc.sendtoaddress(addrs.transparent[0], send_amount * 10)
+            rpc.generate(2)
         except Exception as e:
             logger.warning("Failed to fund t-addr for cross-pool sends: %s", e)
 
@@ -446,6 +488,9 @@ def _execute_cross_pool_transfers(rpc: ZcashRPC, nu: NetworkUpgrade,
     records = []
     withdrawable = get_withdrawable_pools(nu)
     active = get_active_pools(nu)
+    # Use 80% of send_amount for cross-pool sends to leave room for fees.
+    # Floor at 0.01 to avoid "Invalid amount" errors from dust amounts.
+    xpool_amount = max(send_amount * 0.8, 0.01)
 
     for from_pool in withdrawable:
         for to_pool in active:
@@ -453,16 +498,8 @@ def _execute_cross_pool_transfers(rpc: ZcashRPC, nu: NetworkUpgrade,
                 continue
             if from_pool == Pool.TRANSPARENT and to_pool == Pool.TRANSPARENT:
                 continue
-            # Skip transparent->sprout via z_sendmany in old versions.
-            # Old zcashd can't create change from coinbase UTXOs in z_sendmany,
-            # and z_shieldcoinbase already handles t->sprout in step 1.
             if from_pool == Pool.TRANSPARENT and to_pool == Pool.SPROUT:
                 continue
-            # Skip Orchard-as-source cross-pool sends in v6+.
-            # zcashd v6.0.0 has a bug ("OrchardWallet::GetSpendInfo with
-            # unknown outpoint") when spending recently-shielded Orchard notes
-            # in cross-pool transfers. This causes zcashd to crash. Orchard
-            # notes are still created via z_shieldcoinbase and same-pool sends.
             if from_pool == Pool.ORCHARD and from_pool != to_pool:
                 continue
 
@@ -485,7 +522,7 @@ def _execute_cross_pool_transfers(rpc: ZcashRPC, nu: NetworkUpgrade,
                     logger.info("Cross-pool: transparent -> %s", to_name)
                     record = send_between_pools(
                         rpc, from_addr, to_addr, "transparent", to_name,
-                        send_amount, phase_index=phase_index,
+                        xpool_amount, phase_index=phase_index,
                     )
                     records.append(record)
 
@@ -493,7 +530,7 @@ def _execute_cross_pool_transfers(rpc: ZcashRPC, nu: NetworkUpgrade,
                     logger.info("Cross-pool: %s -> transparent", from_name)
                     record = send_between_pools(
                         rpc, from_addr, to_addr, from_name, "transparent",
-                        send_amount, phase_index=phase_index,
+                        xpool_amount, phase_index=phase_index,
                     )
                     records.append(record)
 
@@ -505,13 +542,13 @@ def _execute_cross_pool_transfers(rpc: ZcashRPC, nu: NetworkUpgrade,
                     )
                     record1 = send_between_pools(
                         rpc, from_addr, t_addr, from_name, "transparent",
-                        send_amount, phase_index=phase_index,
+                        xpool_amount, phase_index=phase_index,
                     )
                     records.append(record1)
 
                     record2 = send_between_pools(
                         rpc, t_addr, to_addr, "transparent", to_name,
-                        send_amount * 0.9,
+                        xpool_amount * 0.8,
                         phase_index=phase_index,
                     )
                     records.append(record2)

@@ -335,3 +335,7 @@ Old zcashd versions (v1.0.x) exit with code 1 for `--version` even when they pri
 - [zcashd Regtest Tips](https://zcash.github.io/zcash/dev/regtest.html) -- Regtest guide
 - [zcashd GitHub Releases](https://github.com/zcash/zcash/releases) -- All zcashd versions
 - [zcashd Binary Downloads](https://download.z.cash/downloads/) -- Pre-built binaries
+
+## License
+
+This project is licensed under the [GNU General Public License v3.0 or later](LICENSE) (`GPL-3.0-or-later`).
